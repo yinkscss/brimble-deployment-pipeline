@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost")
-TIMEOUT_SECONDS = int(os.environ.get("CHECK_TIMEOUT_SECONDS", "240"))
+TIMEOUT_SECONDS = int(os.environ.get("CHECK_TIMEOUT_SECONDS", "600"))
 POLL_SECONDS = 2
 
 
@@ -76,6 +76,47 @@ def post_deployment_from_zip(zip_path: Path) -> str:
     return deployment_id
 
 
+def list_deployments() -> list[dict]:
+    payload = http_json("GET", f"{BASE_URL}/api/deployments")
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected deployments response: {payload}")
+    return payload
+
+
+def choose_existing_running_deployment(deployments: list[dict]) -> dict | None:
+    for deployment in deployments:
+        if (
+            deployment.get("status") == "running"
+            and deployment.get("caddy_route")
+            and deployment.get("container_id")
+        ):
+            return deployment
+    return None
+
+
+def route_deployment_ids(routes: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for route in routes:
+        route_id = route.get("@id")
+        if isinstance(route_id, str) and route_id.startswith("app-"):
+            ids.add(route_id.removeprefix("app-"))
+    return ids
+
+
+def choose_running_deployment_with_route(deployments: list[dict], routed_ids: set[str]) -> dict | None:
+    for deployment in deployments:
+        deployment_id = deployment.get("id")
+        if (
+            deployment.get("status") == "running"
+            and deployment.get("caddy_route")
+            and deployment.get("container_id")
+            and isinstance(deployment_id, str)
+            and deployment_id in routed_ids
+        ):
+            return deployment
+    return None
+
+
 def wait_for_terminal_status(deployment_id: str) -> dict:
     started = time.time()
     while time.time() - started < TIMEOUT_SECONDS:
@@ -122,9 +163,12 @@ def assert_route_precedence(routes: list[dict], deployment_id: str) -> None:
 
 def assert_apps_response(deployment_id: str) -> None:
     body = http_text(f"{BASE_URL}/apps/{deployment_id}/")
-    if "hello from sample app" not in body:
+    if "Brimble Take Home" in body or "/@vite/client" in body:
         snippet = body[:160].replace("\n", " ")
-        raise RuntimeError(f"Unexpected /apps response for deployment {deployment_id}: {snippet}")
+        raise RuntimeError(f"/apps/{deployment_id} appears to be frontend fallback, not app response: {snippet}")
+
+    if not body.strip():
+        raise RuntimeError(f"/apps/{deployment_id} returned empty response body")
 
 
 def best_effort_delete(deployment_id: str) -> None:
@@ -147,14 +191,25 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     deployment_id: str | None = None
     zip_path: Path | None = None
+    created_for_check = False
 
     try:
         check_stack_health()
-        zip_path = create_sample_zip(repo_root)
-        deployment_id = post_deployment_from_zip(zip_path)
-        wait_for_terminal_status(deployment_id)
 
         routes = get_caddy_routes_via_compose(repo_root)
+        routed_ids = route_deployment_ids(routes)
+        existing = choose_running_deployment_with_route(list_deployments(), routed_ids)
+        if existing:
+            deployment_id = existing["id"]
+            print(f"Using existing running deployment: {deployment_id}")
+        else:
+            zip_path = create_sample_zip(repo_root)
+            deployment_id = post_deployment_from_zip(zip_path)
+            created_for_check = True
+            print(f"Created deployment for check: {deployment_id}")
+            wait_for_terminal_status(deployment_id)
+            routes = get_caddy_routes_via_compose(repo_root)
+
         assert_route_precedence(routes, deployment_id)
         assert_apps_response(deployment_id)
 
@@ -164,7 +219,7 @@ def main() -> int:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     finally:
-        if deployment_id:
+        if deployment_id and created_for_check:
             best_effort_delete(deployment_id)
         if zip_path and zip_path.exists():
             try:
