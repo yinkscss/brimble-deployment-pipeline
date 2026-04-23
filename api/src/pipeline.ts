@@ -89,10 +89,14 @@ async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstrea
     ]
   };
 
-  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes/0`, {
-    method: "POST",
+  const routes = await readCaddyRoutes();
+  const insertionIndex = getAppRouteInsertionIndex(routes);
+  const nextRoutes = [...routes.slice(0, insertionIndex), payload, ...routes.slice(insertionIndex)];
+
+  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`, {
+    method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(nextRoutes)
   });
 
   if (!res.ok) {
@@ -100,6 +104,23 @@ async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstrea
     throw new Error(`Failed to configure Caddy route: ${res.status} ${body}`);
   }
   return route;
+}
+
+type CaddyRoute = { match?: Array<{ path?: string[] }> };
+
+async function readCaddyRoutes(): Promise<CaddyRoute[]> {
+  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Failed to read Caddy routes: ${res.status} ${body}`);
+  }
+  return (await res.json()) as CaddyRoute[];
+}
+
+function getAppRouteInsertionIndex(routes: CaddyRoute[]): number {
+  const catchAllIndex = routes.findIndex((entry) => !entry.match || entry.match.length === 0);
+  if (catchAllIndex === -1) return routes.length;
+  return catchAllIndex;
 }
 
 export async function removeCaddyRouteByPath(caddyRoute: string): Promise<void> {
