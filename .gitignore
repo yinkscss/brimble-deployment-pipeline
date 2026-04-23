@@ -13,3 +13,5 @@ AGENTS.md
 agents.md
 agent.md
 agent-tools
+*.tsbuildinfo
+frontend/src/*.js
