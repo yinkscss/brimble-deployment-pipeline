@@ -142,7 +142,7 @@ Timeouts send `SIGTERM`, then `SIGKILL` after a short grace period, mark the dep
 
 ## Brimble deployment + feedback
 
-- Brimble deploy URL: **`<PASTE BRIMBLE URL HERE AFTER DEPLOY>`**
+- Brimble deploy URL: **<https://brimble-deployment-pipeline.brimble.app/>**
 - Source deployed to Brimble: [`brimble-site/`](./brimble-site) (a self-contained Vite landing page that auto-detects on Brimble).
 
 ### How to deploy the companion site to Brimble
