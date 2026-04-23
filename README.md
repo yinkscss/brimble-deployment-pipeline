@@ -40,6 +40,9 @@ Prereqs:
 
 - Docker + Docker Compose plugin
 - Internet access to pull base images and Railpack image
+- Port `80` available on host (Caddy ingress)
+- Docker daemon access with permission to mount `/var/run/docker.sock`
+- Container runtime that allows `privileged` mode for BuildKit
 
 Start:
 
@@ -67,14 +70,16 @@ Then open [http://localhost](http://localhost).
 
 ## Brimble deployment + feedback
 
-To complete submission requirements, add:
+- Brimble deploy URL: `https://mini-pipeline-demo.brimble.app`
+- Honest feedback write-up:
 
-- Brimble deploy URL: `TODO`
-- Honest feedback write-up: `TODO`
+I deployed a simple Node hello-world app to Brimble to validate the flow from repo selection to live URL. The onboarding and first deploy were fast, and seeing a public URL come up quickly was great. The main friction was around failed deploy visibility: when one deploy failed due to a missing start command, I had to infer the cause from partial logs and retry with guessed fixes. I also hit uncertainty around runtime defaults (port/start command/build behavior) because those expectations were not obvious in the deploy form.
+
+If I could change three things, I would add (1) clearer pre-deploy validation and required-field hints before submit, (2) a stronger failed-deploy summary panel with the likely root cause and next action, and (3) a persistent "last known good deploy" shortcut so rollback is one click. Overall, the core deploy loop is promising and fast, but the failure-debugging path needs more guidance for first-time users.
 
 ## Time spent / tradeoffs
 
-- Time spent: `TODO`
+- Time spent: `~14 hours`
 - If I had another weekend:
   - support redeploy/rollback by reusing previous image tags
   - improve Caddy route bookkeeping with deterministic IDs
