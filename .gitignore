@@ -1,0 +1,17 @@
+node_modules
+dist
+.DS_Store
+*.log
+.env
+tmp
+api/tmp
+api/.turbo
+frontend/.turbo
+postgres_data
+.cursor
+AGENTS.md
+agents.md
+agent.md
+agent-tools
+*.tsbuildinfo
+frontend/src/*.js
