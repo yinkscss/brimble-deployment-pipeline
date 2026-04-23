@@ -5,10 +5,12 @@ import {
   createDeploymentFromUpload,
   deleteDeployment,
   getDeployment,
+  listBuilds,
   listDeployments,
-  logsSseUrl
+  logsSseUrl,
+  rollbackDeployment
 } from "./api";
-import type { Deployment, LogEvent } from "./types";
+import type { Build, Deployment, LogEvent } from "./types";
 
 function badge(status: Deployment["status"]): string {
   switch (status) {
@@ -29,6 +31,17 @@ function badge(status: Deployment["status"]): string {
 
 const isTerminal = (status: Deployment["status"]) => status === "running" || status === "failed" || status === "deleted";
 
+function buildBadgeClass(status: Build["status"]): string {
+  switch (status) {
+    case "succeeded":
+      return "badge badge-running";
+    case "failed":
+      return "badge badge-failed";
+    default:
+      return "badge badge-building";
+  }
+}
+
 export function App() {
   const qc = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -45,6 +58,7 @@ export function App() {
   const [logFilter, setLogFilter] = useState<"all" | "stdout" | "stderr">("all");
   const [logQuery, setLogQuery] = useState("");
   const [logsPaused, setLogsPaused] = useState(false);
+  const [streamEpoch, setStreamEpoch] = useState(0);
 
   useEffect(() => {
     logsPausedRef.current = logsPaused;
@@ -107,6 +121,18 @@ export function App() {
     }
   });
 
+  const buildsQuery = useQuery({
+    queryKey: ["builds", selectedId],
+    queryFn: () => listBuilds(selectedId!),
+    enabled: Boolean(selectedId),
+    refetchInterval: (q) => {
+      const builds = q.state.data ?? [];
+      const anyInFlight = builds.some((b) => b.status === "building");
+      const selectedStatus = selectedDeployment?.status;
+      return anyInFlight || (selectedStatus && !isTerminal(selectedStatus)) ? 3000 : false;
+    }
+  });
+
   const createMutation = useMutation({
     mutationFn: async (payload: { gitUrl?: string; file?: File | null }) => {
       if (payload.file) return createDeploymentFromUpload(payload.file);
@@ -128,6 +154,18 @@ export function App() {
     mutationFn: deleteDeployment,
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ["deployments"] });
+    }
+  });
+
+  const rollbackMutation = useMutation({
+    mutationFn: ({ deploymentId, buildId }: { deploymentId: string; buildId: string }) =>
+      rollbackDeployment(deploymentId, buildId),
+    onSuccess: async (_, variables) => {
+      setSelectedId(variables.deploymentId);
+      setStreamState("idle");
+      setStreamEpoch((n) => n + 1);
+      await qc.invalidateQueries({ queryKey: ["deployments"] });
+      await qc.invalidateQueries({ queryKey: ["builds", variables.deploymentId] });
     }
   });
 
@@ -175,7 +213,7 @@ export function App() {
     return () => {
       es.close();
     };
-  }, [qc, selectedId]);
+  }, [qc, selectedId, streamEpoch]);
 
   return (
     <main className="container">
@@ -370,6 +408,102 @@ export function App() {
                     </td>
                   </tr>
                 ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="panel" aria-labelledby="build-history-heading">
+        <div className="panel-header">
+          <h2 id="build-history-heading" className="panel-title">
+            Build History {selectedDeployment ? `(${selectedDeployment.id.slice(0, 8)})` : ""}
+          </h2>
+          <p className="panel-note">
+            {selectedDeployment
+              ? "Each successful build keeps its image. Rollback swaps the running container to any previous build without rebuilding."
+              : "Select a deployment to view its build history."}
+          </p>
+        </div>
+        <div className="table-wrap" role="region" aria-label="Build history" tabIndex={0}>
+          <table className="deployments-table">
+            <thead>
+              <tr>
+                <th>Build ID</th>
+                <th>Image Tag</th>
+                <th>Source</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {!selectedDeployment ? (
+                <tr>
+                  <td colSpan={6}>
+                    <div className="empty-state">
+                      <p>No deployment selected.</p>
+                      <span>Click a deployment row above to view its build history and rollback targets.</span>
+                    </div>
+                  </td>
+                </tr>
+              ) : (buildsQuery.data ?? []).length === 0 ? (
+                <tr>
+                  <td colSpan={6}>
+                    <div className="empty-state">
+                      <p>No builds recorded yet.</p>
+                      <span>Build history populates once the first pipeline run produces an image.</span>
+                    </div>
+                  </td>
+                </tr>
+              ) : (
+                (buildsQuery.data ?? []).map((b) => {
+                  const isActive = selectedDeployment.active_build_id === b.id;
+                  const canRollback =
+                    b.status === "succeeded" &&
+                    !isActive &&
+                    selectedDeployment.status !== "building" &&
+                    selectedDeployment.status !== "deploying" &&
+                    selectedDeployment.status !== "pending" &&
+                    selectedDeployment.status !== "deleted";
+                  return (
+                    <tr key={b.id} className="deployment-row">
+                      <td>
+                        <span className="mono">{b.id.slice(-10)}</span>
+                        {isActive ? <span className="badge badge-running" style={{ marginLeft: 8 }}>active</span> : null}
+                      </td>
+                      <td className="mono truncate" title={b.image_tag}>{b.image_tag}</td>
+                      <td>{b.source}</td>
+                      <td>
+                        <span className={buildBadgeClass(b.status)}>
+                          <span className="badge-dot" aria-hidden="true" />
+                          {b.status}
+                        </span>
+                      </td>
+                      <td>
+                        <time dateTime={b.created_at}>{new Date(b.created_at).toLocaleString()}</time>
+                      </td>
+                      <td>
+                        <button
+                          className="btn btn-ghost"
+                          disabled={!canRollback || rollbackMutation.isPending}
+                          onClick={() =>
+                            rollbackMutation.mutate({ deploymentId: selectedDeployment.id, buildId: b.id })
+                          }
+                          title={
+                            isActive
+                              ? "Already active"
+                              : b.status !== "succeeded"
+                              ? "Only succeeded builds can be rolled back to"
+                              : "Swap the running container to this build"
+                          }
+                        >
+                          {rollbackMutation.isPending ? "Rolling back..." : "Rollback"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

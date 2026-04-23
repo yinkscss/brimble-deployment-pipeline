@@ -5,20 +5,29 @@ import { ulid } from "ulid";
 import { z } from "zod";
 import {
   createDeployment,
+  getBuild,
   getDeployment,
   getLogsAfter,
   getLogs,
   initDb,
+  listBuilds,
   listDeployments,
   setDeploymentStatus,
   updateDeployment
 } from "./db.js";
 import { publishEvent, subscribe, unsubscribe } from "./logHub.js";
-import { destroyContainer, processDeployment, processUploadedDeployment, removeCaddyRouteByPath } from "./pipeline.js";
+import {
+  destroyContainer,
+  processDeployment,
+  processRollback,
+  processUploadedDeployment,
+  removeCaddyRouteByPath
+} from "./pipeline.js";
 
 const app = express();
 const port = Number(process.env.PORT ?? "3001");
 const deploymentSchema = z.object({ git_url: z.string().url().optional() });
+const rollbackSchema = z.object({ build_id: z.string().min(1) });
 const upload = multer({ dest: "/app/tmp/uploads" });
 
 app.use(cors());
@@ -55,6 +64,43 @@ app.get("/deployments/:id", async (req, res) => {
   res.json(row);
 });
 
+app.get("/deployments/:id/builds", async (req, res) => {
+  const deployment = await getDeployment(req.params.id);
+  if (!deployment) return res.status(404).json({ error: "Deployment not found" });
+  const rows = await listBuilds(req.params.id);
+  res.json(rows);
+});
+
+app.post("/deployments/:id/rollback", async (req, res) => {
+  const parsed = rollbackSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "Invalid payload", details: parsed.error.issues });
+
+  const deployment = await getDeployment(req.params.id);
+  if (!deployment) return res.status(404).json({ error: "Deployment not found" });
+  if (deployment.status === "deleted") {
+    return res.status(409).json({ error: "Cannot rollback a deleted deployment" });
+  }
+  if (deployment.status === "pending" || deployment.status === "building" || deployment.status === "deploying") {
+    return res.status(409).json({ error: `Deployment is ${deployment.status}; wait for it to settle before rolling back` });
+  }
+
+  const build = await getBuild(parsed.data.build_id);
+  if (!build || build.deployment_id !== req.params.id) {
+    return res.status(404).json({ error: "Build not found for this deployment" });
+  }
+  if (build.status !== "succeeded") {
+    return res.status(409).json({ error: `Build is not succeeded (status=${build.status})` });
+  }
+  if (deployment.active_build_id && deployment.active_build_id === build.id) {
+    return res.status(409).json({ error: "Build is already active" });
+  }
+
+  void processRollback(req.params.id, parsed.data.build_id).catch(() => {
+    // errors are surfaced through pipeline_failed SSE events and build status
+  });
+  res.status(202).json({ ok: true, build_id: parsed.data.build_id });
+});
+
 app.get("/deployments/:id/logs", async (req, res) => {
   const deployment = await getDeployment(req.params.id);
   if (!deployment) return res.status(404).json({ error: "Deployment not found" });
@@ -85,13 +131,17 @@ app.get("/deployments/:id/logs", async (req, res) => {
   }, 15000);
 
   subscribe(req.params.id, res);
-  if (deployment.status === "running") {
+  const terminalSnapshot = await getDeployment(req.params.id);
+  if (terminalSnapshot && terminalSnapshot.status === "running") {
     res.write(
-      `event: pipeline_done\ndata: ${JSON.stringify({ status: "running", caddy_route: deployment.caddy_route })}\n\n`
+      `event: pipeline_done\ndata: ${JSON.stringify({
+        status: "running",
+        caddy_route: terminalSnapshot.caddy_route
+      })}\n\n`
     );
-  } else if (deployment.status === "deleted") {
+  } else if (terminalSnapshot && terminalSnapshot.status === "deleted") {
     res.write(`event: pipeline_done\ndata: ${JSON.stringify({ status: "deleted" })}\n\n`);
-  } else if (deployment.status === "failed") {
+  } else if (terminalSnapshot && terminalSnapshot.status === "failed") {
     res.write(`event: pipeline_failed\ndata: ${JSON.stringify({ status: "failed" })}\n\n`);
   }
   req.on("close", () => {

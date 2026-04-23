@@ -1,4 +1,4 @@
-import type { Deployment } from "./types";
+import type { Build, Deployment } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
@@ -38,6 +38,21 @@ export async function getDeployment(id: string): Promise<Deployment> {
 
 export async function deleteDeployment(id: string): Promise<void> {
   const res = await fetch(`${API_BASE}/deployments/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function listBuilds(id: string): Promise<Build[]> {
+  const res = await fetch(`${API_BASE}/deployments/${id}/builds`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function rollbackDeployment(id: string, buildId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/deployments/${id}/rollback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ build_id: buildId })
+  });
   if (!res.ok) throw new Error(await res.text());
 }
 

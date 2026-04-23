@@ -67,6 +67,8 @@ services:
     image: moby/buildkit:latest
     command: ["--addr", "tcp://0.0.0.0:1234"]
     privileged: true
+    volumes:
+      - buildkit_cache:/var/lib/buildkit
     healthcheck:
       test: ["CMD", "buildctl", "--addr", "tcp://127.0.0.1:1234", "debug", "workers"]
       interval: 5s
@@ -101,6 +103,7 @@ volumes:
   api_tmp:
   caddy_data:
   caddy_config:
+  buildkit_cache:
 
 networks:
   platform:

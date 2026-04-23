@@ -23,25 +23,30 @@ Project execution will prioritize these requirements over optional polish.
 
 ### End-to-end flow
 
-1. User submits `git_url` in frontend.
+1. User submits `git_url` (or uploads a ZIP) in frontend.
 2. Frontend `POST /api/deployments` to API.
 3. API creates `Deployment` row with status `pending`.
 4. API immediately enqueues async pipeline worker (non-blocking HTTP response).
 5. Pipeline stages:
-   - `pending` -> clone repo to temp workspace.
-   - `building` -> run `railpack build` and capture stdout/stderr.
+   - `pending` -> clone repo / unzip upload to temp workspace.
+   - A new `Build` row is created (`status=building`, `source=git|upload`) with a unique image tag `deployment-<deploymentId>:<buildId>`.
+   - `building` -> run `railpack build --name <imageTag>` and capture stdout/stderr.
    - Persist each log line to `Log` table and broadcast to active SSE clients.
-   - On successful build, set deterministic image tag `deployment-{id}:latest`.
-   - `deploying` -> stop/remove previous container (if redeploy path), then `docker run` new container on internal Docker network.
-   - Discover app container port (strategy: inspect metadata + fallback to configured default `3000`, with override support).
-   - Configure Caddy route via Admin API to map `/apps/{id}/*` to container upstream.
-   - Update `Deployment` with `container_id`, `caddy_route`, `status=running`.
-6. If any step fails (including clone/unzip/build timeouts):
+   - On successful build, the build row transitions to `succeeded`.
+   - `deploying` -> zero-downtime swap:
+     1. `docker run` a fresh container named `app-<deploymentId>-<buildShort>` on the shared network (old container left running, if any).
+     2. Probe `/` on the new container until ready (per-attempt + global timeout).
+     3. Atomically patch the Caddy `/apps/:id/*` route to the new upstream host.
+     4. Gracefully `SIGTERM`-then-`SIGKILL` the previous container after `GRACEFUL_STOP_TIMEOUT_S`.
+   - Update `Deployment` with `container_id`, `caddy_route`, `image_tag`, `active_build_id`, `status=running`.
+6. If any step fails (including clone/unzip/build timeouts or readiness timeout):
    - Persist error log lines.
-   - Set status `failed`.
+   - Set `Deployment.status=failed` and `Build.status=failed`.
+   - If the new container was created but never became ready, it is torn down and the previous container keeps serving traffic.
    - Emit SSE terminal event `pipeline_failed` with `{ status: "failed", message? }`.
 7. On success, emit SSE terminal event `pipeline_done` with `{ status: "running", caddy_route }`.
-8. Frontend displays deployment list and selected deployment log stream.
+8. Frontend displays deployment list, build history, and selected deployment log stream.
+9. **Rollback path** (`POST /api/deployments/:id/rollback`) reuses steps 5-7 with the target build's existing image tag and no rebuild.
 
 ### Key technical constraints
 
@@ -71,11 +76,30 @@ interface Deployment {
   id: string; // ulid
   git_url: string;
   status: DeploymentStatus;
-  image_tag: string | null;
-  container_id: string | null;
+  image_tag: string | null;        // currently-active build's image tag
+  container_id: string | null;     // currently-routed container id
   caddy_route: string | null;
+  active_build_id: string | null;  // FK into builds(id)
   created_at: string; // ISO timestamp
   updated_at: string; // ISO timestamp
+}
+```
+
+### Build
+
+```ts
+type BuildStatus = "building" | "succeeded" | "failed";
+type BuildSource = "git" | "upload" | "rollback";
+
+interface Build {
+  id: string; // ulid, used as the image tag suffix
+  deployment_id: string;
+  image_tag: string;              // deployment-<depId>:<buildId>
+  status: BuildStatus;
+  source: BuildSource;
+  parent_build_id: string | null; // set when source="rollback"
+  created_at: string;
+  updated_at: string;
 }
 ```
 
@@ -133,6 +157,21 @@ interface Log {
 - Stops/removes deployment container if present.
 - Removes Caddy dynamic route via the Admin API (under a process-local mutex).
 - Keeps deployment record for audit, clears container metadata, transitions status to the terminal value `deleted`, and emits a final `pipeline_done` SSE event with `{ status: "deleted" }`.
+
+### `GET /api/deployments/:id/builds`
+
+- Response: `Build[]` sorted `created_at desc`.
+- Drives the Build History panel in the UI.
+
+### `POST /api/deployments/:id/rollback`
+
+- Request: `{ build_id: string }`
+- Response: `202` on accept, `404/409` on invalid target or non-settled deployment state.
+- Behavior:
+  - Rejects if the deployment is `pending | building | deploying | deleted`, if the target build is not `status=succeeded`, or if the target is already the active build.
+  - Records a new `Build` row with `source="rollback"` and `parent_build_id=<target>` so history retains the rollback event.
+  - Executes the same zero-downtime swap as a fresh deploy, reusing the target build's existing image tag (no rebuild).
+  - Emits `pipeline_done` on success, `pipeline_failed` otherwise.
 
 ## 4) SSE log streaming end-to-end
 
@@ -197,6 +236,7 @@ interface Log {
 
 - Shared Docker network `brimble-platform` (declared with an explicit `name:` in compose so the API attaches newly-run deployment containers to the same network Caddy uses).
 - Volume `postgres_data` for DB persistence.
+- Volume `buildkit_cache` mounted at `/var/lib/buildkit` in the `buildkit` service so BuildKit's layer cache is reused across compose restarts and across different deployments of the same base images.
 - Container-local tmpfs for clone/unzip/build workspace under `/tmp`.
 
 ## Service healthchecks (compose)
@@ -259,4 +299,6 @@ interface Log {
   - `dockerode` for inspect/stop/remove/network operations.
   - shell spawn for Railpack build command and optional `docker run` parity.
 - **Path-based routing** (`/apps/{id}`): simplest local dev story (no wildcard DNS needed), aligns with single-ingress requirement.
+- **Per-build image tags and container names**: enables zero-downtime swap (new container brought up before old one is torn down), makes rollback a metadata-only operation, and keeps each build independently referenceable and addressable on the Docker network.
+- **Persistent BuildKit cache volume**: Railpack drives BuildKit via `BUILDKIT_HOST=tcp://buildkit:1234`; persisting `/var/lib/buildkit` turns "warm" rebuilds into seconds instead of minutes.
 

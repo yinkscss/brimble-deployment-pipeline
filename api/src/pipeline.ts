@@ -3,9 +3,17 @@ import { spawn } from "node:child_process";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { ulid } from "ulid";
-import { appendLog, setDeploymentStatus, updateDeployment } from "./db.js";
+import {
+  appendLog,
+  createBuild,
+  getBuild,
+  getDeployment,
+  setBuildStatus,
+  setDeploymentStatus,
+  updateDeployment
+} from "./db.js";
 import { publish, publishEvent } from "./logHub.js";
-import type { LogStream } from "./types.js";
+import type { BuildSource, LogStream } from "./types.js";
 
 const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 const CADDY_ADMIN_URL = process.env.CADDY_ADMIN_URL ?? "http://caddy:2019";
@@ -17,6 +25,8 @@ const UNZIP_TIMEOUT_MS = Number(process.env.UNZIP_TIMEOUT_MS ?? "120000");
 const BUILD_TIMEOUT_MS = Number(process.env.BUILD_TIMEOUT_MS ?? "1200000");
 const COMMAND_KILL_GRACE_MS = 5000;
 const READINESS_PROBE_TIMEOUT_MS = Number(process.env.READINESS_PROBE_TIMEOUT_MS ?? "3000");
+const GRACEFUL_STOP_TIMEOUT_S = Number(process.env.GRACEFUL_STOP_TIMEOUT_S ?? "10");
+
 let caddyMutationLock: Promise<void> = Promise.resolve();
 
 async function withCaddyMutationLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -129,7 +139,11 @@ async function runCommand(
   });
 }
 
-async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstreamPort: number): Promise<string> {
+async function putCaddyRoute(
+  deploymentId: string,
+  upstreamHost: string,
+  upstreamPort: number
+): Promise<string> {
   return withCaddyMutationLock(async () => {
     const route = `${APPS_BASE_PATH}/${deploymentId}`;
     const routeId = `app-${deploymentId}`;
@@ -209,12 +223,40 @@ export async function removeCaddyRouteByPath(caddyRoute: string): Promise<void> 
   });
 }
 
+function shortBuildId(buildId: string): string {
+  return buildId.slice(-10).toLowerCase();
+}
+
+function containerNameFor(deploymentId: string, buildId: string): string {
+  return `app-${deploymentId.toLowerCase()}-${shortBuildId(buildId)}`;
+}
+
+function imageTagFor(deploymentId: string, buildId: string): string {
+  return `deployment-${deploymentId.toLowerCase()}:${buildId.toLowerCase()}`;
+}
+
+async function gracefulDestroyContainer(containerId: string): Promise<void> {
+  const c = docker.getContainer(containerId);
+  try {
+    await c.stop({ t: GRACEFUL_STOP_TIMEOUT_S });
+  } catch {
+    // ignore: may already be stopped or removed
+  }
+  try {
+    await c.remove({ force: true });
+  } catch {
+    // ignore: idempotent removal
+  }
+}
+
 export async function processDeployment(deploymentId: string, gitUrl: string): Promise<void> {
   const workdir = join("/app/tmp", deploymentId);
   await mkdir(workdir, { recursive: true });
   try {
-    await runCommand(deploymentId, "git", ["clone", "--depth", "1", gitUrl, workdir], { timeoutMs: CLONE_TIMEOUT_MS });
-    await runPipelineFromDirectory(deploymentId, workdir);
+    await runCommand(deploymentId, "git", ["clone", "--depth", "1", gitUrl, workdir], {
+      timeoutMs: CLONE_TIMEOUT_MS
+    });
+    await runBuildAndDeploy(deploymentId, workdir, "git");
   } catch (error) {
     await setDeploymentStatus(deploymentId, "failed");
     await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
@@ -231,12 +273,14 @@ export async function processUploadedDeployment(deploymentId: string, archivePat
   const workdir = join("/app/tmp", deploymentId);
   await mkdir(workdir, { recursive: true });
   try {
-    await runCommand(deploymentId, "unzip", ["-q", archivePath, "-d", workdir], { timeoutMs: UNZIP_TIMEOUT_MS });
+    await runCommand(deploymentId, "unzip", ["-q", archivePath, "-d", workdir], {
+      timeoutMs: UNZIP_TIMEOUT_MS
+    });
     const projectDir = await resolveProjectDirectory(workdir);
     if (projectDir !== workdir) {
       await addLog(deploymentId, `Detected nested project root: ${projectDir}`, "stdout");
     }
-    await runPipelineFromDirectory(deploymentId, projectDir);
+    await runBuildAndDeploy(deploymentId, projectDir, "upload");
   } catch (error) {
     await setDeploymentStatus(deploymentId, "failed");
     await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
@@ -285,50 +329,79 @@ async function waitForAppReadiness(
   throw new Error(`Timed out waiting for app readiness after ${READINESS_TIMEOUT_MS / 1000}s`);
 }
 
-async function runPipelineFromDirectory(deploymentId: string, workdir: string): Promise<void> {
-  const imageTag = `deployment-${deploymentId.toLowerCase()}:latest`;
-  let containerId: string | null = null;
-  let caddyRoute: string | null = null;
+async function runBuildAndDeploy(
+  deploymentId: string,
+  workdir: string,
+  source: Exclude<BuildSource, "rollback">
+): Promise<void> {
+  const buildId = ulid();
+  const imageTag = imageTagFor(deploymentId, buildId);
+  const buildRow = await createBuild(buildId, deploymentId, imageTag, source, null);
   try {
     await setDeploymentStatus(deploymentId, "building");
+    await addLog(deploymentId, `Build ${buildRow.id} started (image ${imageTag})`, "stdout");
     await runCommand(deploymentId, "railpack", ["build", "--name", imageTag, "--progress", "plain", workdir], {
       timeoutMs: BUILD_TIMEOUT_MS
     });
-    await updateDeployment(deploymentId, { image_tag: imageTag, status: "deploying" });
+    await setBuildStatus(buildRow.id, "succeeded");
+    await addLog(deploymentId, `Build ${buildRow.id} succeeded`, "stdout");
+    await swapToBuild(deploymentId, buildRow.id, imageTag);
+  } catch (error) {
+    await setBuildStatus(buildRow.id, "failed");
+    throw error;
+  }
+}
 
-    const container = await docker.createContainer({
+async function swapToBuild(deploymentId: string, buildId: string, imageTag: string): Promise<void> {
+  const previous = await getDeployment(deploymentId);
+  const previousContainerId = previous?.container_id ?? null;
+
+  await setDeploymentStatus(deploymentId, "deploying");
+  await addLog(deploymentId, `Swapping deployment to build ${buildId} (${imageTag})`, "stdout");
+
+  const containerName = containerNameFor(deploymentId, buildId);
+  let container: Docker.Container | null = null;
+  try {
+    container = await docker.createContainer({
       Image: imageTag,
-      name: `app-${deploymentId}`,
-      HostConfig: { NetworkMode: DOCKER_NETWORK },
+      name: containerName,
+      HostConfig: {
+        NetworkMode: DOCKER_NETWORK,
+        RestartPolicy: { Name: "unless-stopped" }
+      },
       Env: ["PORT=3000"]
     });
     await container.start();
-    containerId = container.id;
-    await addLog(deploymentId, `Container started: ${containerId}`, "stdout");
+    await addLog(deploymentId, `Container ${containerName} started (${container.id})`, "stdout");
 
     const inspect = await container.inspect();
     const port = Number(Object.keys(inspect.Config.ExposedPorts ?? {}).at(0)?.split("/")[0] ?? "3000");
-    const upstreamHost = `app-${deploymentId}`;
-    await waitForAppReadiness(deploymentId, upstreamHost, port);
+    await waitForAppReadiness(deploymentId, containerName, port);
 
-    caddyRoute = await putCaddyRoute(deploymentId, upstreamHost, port);
-    await updateDeployment(deploymentId, { status: "running", container_id: containerId, caddy_route: caddyRoute });
+    const caddyRoute = await putCaddyRoute(deploymentId, containerName, port);
+    await addLog(deploymentId, `Caddy route swapped to ${containerName}:${port}`, "stdout");
+
+    await updateDeployment(deploymentId, {
+      status: "running",
+      image_tag: imageTag,
+      container_id: container.id,
+      caddy_route: caddyRoute,
+      active_build_id: buildId
+    });
+
+    if (previousContainerId && previousContainerId !== container.id) {
+      await addLog(deploymentId, `Gracefully stopping previous container ${previousContainerId}`, "stdout");
+      await gracefulDestroyContainer(previousContainerId);
+      await addLog(deploymentId, `Previous container ${previousContainerId} removed`, "stdout");
+    }
+
     publishEvent(deploymentId, "pipeline_done", { status: "running", caddy_route: caddyRoute });
   } catch (error) {
     await setDeploymentStatus(deploymentId, "failed");
     await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
-    if (containerId) {
+    if (container) {
       try {
-        const c = docker.getContainer(containerId);
-        await c.stop({ t: 2 });
-        await c.remove({ force: true });
-      } catch {
-        // best-effort cleanup
-      }
-    }
-    if (caddyRoute) {
-      try {
-        await removeCaddyRouteByPath(caddyRoute);
+        await gracefulDestroyContainer(container.id);
       } catch {
         // best-effort cleanup
       }
@@ -337,15 +410,41 @@ async function runPipelineFromDirectory(deploymentId: string, workdir: string): 
       status: "failed",
       message: error instanceof Error ? error.message : "Unknown pipeline error"
     });
+    throw error;
+  }
+}
+
+export async function processRollback(deploymentId: string, targetBuildId: string): Promise<void> {
+  const build = await getBuild(targetBuildId);
+  if (!build || build.deployment_id !== deploymentId) {
+    throw new Error(`Build ${targetBuildId} not found for deployment ${deploymentId}`);
+  }
+  if (build.status !== "succeeded") {
+    throw new Error(`Build ${targetBuildId} is not in 'succeeded' state (status=${build.status})`);
+  }
+
+  const rollbackBuildId = ulid();
+  const rollbackBuildRow = await createBuild(
+    rollbackBuildId,
+    deploymentId,
+    build.image_tag,
+    "rollback",
+    build.id
+  );
+  try {
+    await addLog(
+      deploymentId,
+      `Rollback requested: redeploying build ${build.id} (${build.image_tag}) as ${rollbackBuildId}`,
+      "stdout"
+    );
+    await swapToBuild(deploymentId, rollbackBuildId, build.image_tag);
+    await setBuildStatus(rollbackBuildRow.id, "succeeded");
+  } catch (error) {
+    await setBuildStatus(rollbackBuildRow.id, "failed");
+    throw error;
   }
 }
 
 export async function destroyContainer(containerId: string): Promise<void> {
-  const c = docker.getContainer(containerId);
-  try {
-    await c.stop({ t: 2 });
-  } catch {
-    // ignored
-  }
-  await c.remove({ force: true });
+  await gracefulDestroyContainer(containerId);
 }
