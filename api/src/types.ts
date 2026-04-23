@@ -1,4 +1,4 @@
-export type DeploymentStatus = "pending" | "building" | "deploying" | "running" | "failed";
+export type DeploymentStatus = "pending" | "building" | "deploying" | "running" | "failed" | "deleted";
 export type LogStream = "stdout" | "stderr";
 
 export interface Deployment {

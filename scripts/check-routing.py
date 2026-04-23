@@ -57,10 +57,10 @@ def get_caddy_routes_via_compose(repo_root: Path) -> list[dict]:
         "compose",
         "exec",
         "-T",
-        "caddy",
+        "api",
         "sh",
         "-lc",
-        "curl -sS http://localhost:2019/config/apps/http/servers/srv0/routes",
+        "curl -sS http://caddy:2019/config/apps/http/servers/srv0/routes",
     ]
     result = subprocess.run(command, cwd=repo_root, check=True, capture_output=True, text=True)
     return json.loads(result.stdout)

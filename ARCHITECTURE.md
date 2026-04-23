@@ -36,11 +36,12 @@ Project execution will prioritize these requirements over optional polish.
    - Discover app container port (strategy: inspect metadata + fallback to configured default `3000`, with override support).
    - Configure Caddy route via Admin API to map `/apps/{id}/*` to container upstream.
    - Update `Deployment` with `container_id`, `caddy_route`, `status=running`.
-6. If any step fails:
+6. If any step fails (including clone/unzip/build timeouts):
    - Persist error log lines.
    - Set status `failed`.
-   - Emit SSE terminal event `error`.
-7. Frontend displays deployment list and selected deployment log stream.
+   - Emit SSE terminal event `pipeline_failed` with `{ status: "failed", message? }`.
+7. On success, emit SSE terminal event `pipeline_done` with `{ status: "running", caddy_route }`.
+8. Frontend displays deployment list and selected deployment log stream.
 
 ### Key technical constraints
 
@@ -58,7 +59,13 @@ Project execution will prioritize these requirements over optional polish.
 ### Deployment
 
 ```ts
-type DeploymentStatus = "pending" | "building" | "deploying" | "running" | "failed";
+type DeploymentStatus =
+  | "pending"
+  | "building"
+  | "deploying"
+  | "running"
+  | "failed"
+  | "deleted";
 
 interface Deployment {
   id: string; // ulid
@@ -109,19 +116,23 @@ interface Log {
 ### `GET /api/deployments/:id/logs` (SSE)
 
 - Streams:
-  - Backfill of persisted logs first.
+  - Backfill of persisted logs first (honoring resume cursor).
   - Then live log events as they arrive.
+- Cursoring:
+  - Each log event includes SSE `id:` equal to log ULID.
+  - Reconnect resume cursor can be supplied via `Last-Event-ID` header or `?cursor=<logId>`.
+  - Backfill honors cursor and only emits logs strictly after that cursor.
 - Event payload format:
-  - default event `message` with JSON `{ line, stream, timestamp }`
-- Terminal events:
-  - `event: done` with summary payload.
-  - `event: error` with error payload.
+  - default `message` event with JSON `{ id, line, stream, timestamp }`
+- Terminal events (custom names to avoid colliding with native `EventSource.onerror`):
+  - `event: pipeline_done` with payload `{ status: "running" | "deleted", caddy_route?: string }`
+  - `event: pipeline_failed` with payload `{ status: "failed", message?: string }`
 
 ### `DELETE /api/deployments/:id`
 
 - Stops/removes deployment container if present.
-- Removes Caddy dynamic route.
-- Keeps deployment record for audit; clears container metadata and sets terminal state.
+- Removes Caddy dynamic route via the Admin API (under a process-local mutex).
+- Keeps deployment record for audit, clears container metadata, transitions status to the terminal value `deleted`, and emits a final `pipeline_done` SSE event with `{ status: "deleted" }`.
 
 ## 4) SSE log streaming end-to-end
 
@@ -141,17 +152,26 @@ interface Log {
    - `Connection: keep-alive`
 3. Server sends existing logs from DB (scroll-back).
 4. Server subscribes connection to in-memory live stream.
-5. As logs arrive, server sends `data: {"line": "...", "stream":"stdout","timestamp":"..."}\n\n`
+5. As logs arrive, server sends:
+   ```
+   id: <log-ulid>
+   data: {"id":"<log-ulid>","line":"...","stream":"stdout","timestamp":"..."}
+
+   ```
 6. On pipeline completion:
-   - success -> `event: done`
-   - failure -> `event: error`
+   - success -> `event: pipeline_done` with `{ status: "running", caddy_route }`
+   - failure/timeout -> `event: pipeline_failed` with `{ status: "failed", message? }`
+   - delete -> `event: pipeline_done` with `{ status: "deleted" }`
    - connection may remain open briefly then close.
 7. Client closes stream on terminal event or manual selection change.
 
 ## Reliability notes
 
 - Heartbeat comments (`:keepalive`) every 15s avoid idle disconnects.
-- SSE replay includes all persisted logs, so refresh does not lose context.
+- SSE replay includes all persisted logs (or only logs after a resume cursor), so refresh does not lose context.
+- `runCommand` awaits all in-flight `addLog` writes before resolving/rejecting, so the terminal SSE event never races ahead of the final log line.
+- Pipeline commands (`git clone`, `unzip`, `railpack build`) all run under hard timeouts and are terminated with `SIGTERM -> SIGKILL` on breach.
+- Runtime readiness probes use a per-attempt timeout (`READINESS_PROBE_TIMEOUT_MS`) inside a 120s global budget so a hung upstream cannot stall the pipeline.
 
 ## 5) Docker Compose topology (services, communication, volumes)
 
@@ -175,9 +195,16 @@ interface Log {
 
 ## Networks/volumes
 
-- Shared network `platform` for all services and app containers.
+- Shared Docker network `brimble-platform` (declared with an explicit `name:` in compose so the API attaches newly-run deployment containers to the same network Caddy uses).
 - Volume `postgres_data` for DB persistence.
-- Optional `api_tmp` volume for temp checkouts/build context (or container filesystem tmp).
+- Container-local tmpfs for clone/unzip/build workspace under `/tmp`.
+
+## Service healthchecks (compose)
+
+- `api`: `curl -fsS http://localhost:3001/health`
+- `frontend`: in-process `fetch('http://localhost:5173/')` via `node -e` (base image has no `curl`/`wget`)
+- `caddy`: `caddy version`
+- `frontend` depends on `api: service_healthy`; `caddy` depends on both `api: service_healthy` and `frontend: service_healthy`, which makes `docker compose up` deterministic (Caddy never starts before its upstreams are ready).
 
 ## Compose request flow
 
@@ -208,15 +235,21 @@ interface Log {
 - Structured error boundaries per stage:
   - Catch and annotate errors with stage context.
   - Persist error logs with `stderr`.
-  - Emit terminal SSE `error`.
+  - Emit terminal SSE `pipeline_failed` (custom name avoids collision with native `EventSource` `error`, which fires on transport errors and auto-reconnects).
+- Command timeouts:
+  - Clone/unzip/build each enforce a hard timeout and send `SIGTERM` followed by `SIGKILL` after a short grace period.
+  - Timed-out commands still mark the deployment `failed` and emit `pipeline_failed`.
 - Cleanup on failure:
   - Remove half-created containers.
-  - Roll back Caddy route addition if route creation partially succeeded.
+  - Remove any Caddy route installed for the deployment (via the Admin API, under a process-local mutex so concurrent pipelines cannot clobber each other's route table).
   - Remove temp checkout directory.
+- Concurrency safety:
+  - Caddy route installs and removes are serialized through an in-process mutex; `putCaddyRoute` does a read-modify-write on `srv0/routes` and filters out any stale entry for the same deployment ID before inserting the new one.
 - Observability:
   - Every major action emits logs (clone start/end, build start/end, run start/end, route create/remove).
 - Idempotent delete:
-  - `DELETE` succeeds even if container or route already absent.
+  - `DELETE` succeeds even if container or route already absent (404 from Caddy Admin API is treated as success).
+  - Deleted deployments transition to terminal status `deleted` and emit a final `pipeline_done` SSE event so any connected client observes a clean close.
 
 ## Implementation choices and rationale
 

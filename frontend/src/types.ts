@@ -1,4 +1,4 @@
-export type DeploymentStatus = "pending" | "building" | "deploying" | "running" | "failed";
+export type DeploymentStatus = "pending" | "building" | "deploying" | "running" | "failed" | "deleted";
 
 export interface Deployment {
   id: string;
@@ -12,6 +12,7 @@ export interface Deployment {
 }
 
 export interface LogEvent {
+  id: string;
   line: string;
   stream: "stdout" | "stderr";
   timestamp: string;

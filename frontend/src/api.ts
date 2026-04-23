@@ -41,6 +41,8 @@ export async function deleteDeployment(id: string): Promise<void> {
   if (!res.ok) throw new Error(await res.text());
 }
 
-export function logsSseUrl(id: string): string {
-  return `${API_BASE}/deployments/${id}/logs`;
+export function logsSseUrl(id: string, cursor?: string | null): string {
+  if (!cursor) return `${API_BASE}/deployments/${id}/logs`;
+  const params = new URLSearchParams({ cursor });
+  return `${API_BASE}/deployments/${id}/logs?${params.toString()}`;
 }

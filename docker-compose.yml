@@ -22,7 +22,7 @@ services:
       PORT: 3001
       DATABASE_URL: postgres://brimble:brimble@db:5432/brimble
       CADDY_ADMIN_URL: http://caddy:2019
-      DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-job-application}_platform
+      DOCKER_NETWORK: brimble-platform
       APPS_BASE_PATH: /apps
       BUILDKIT_HOST: tcp://buildkit:1234
     volumes:
@@ -33,6 +33,11 @@ services:
         condition: service_healthy
       buildkit:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3001/health >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - platform
 
@@ -42,7 +47,19 @@ services:
     environment:
       VITE_API_BASE: /api
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:5173/').then((res)=>process.exit(res.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - platform
 
@@ -67,8 +84,15 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - api
-      - frontend
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "caddy version >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - platform
 
@@ -80,3 +104,4 @@ volumes:
 
 networks:
   platform:
+    name: brimble-platform

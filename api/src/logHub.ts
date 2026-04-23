@@ -1,4 +1,5 @@
 import type { Response } from "express";
+import type { LogLine } from "./types.js";
 
 type Client = Response;
 
@@ -17,10 +18,10 @@ export function unsubscribe(deploymentId: string, res: Response): void {
   if (!set.size) clients.delete(deploymentId);
 }
 
-export function publish(deploymentId: string, payload: unknown): void {
+export function publish(deploymentId: string, payload: Pick<LogLine, "id" | "line" | "stream" | "timestamp">): void {
   const set = clients.get(deploymentId);
   if (!set) return;
-  const message = `data: ${JSON.stringify(payload)}\n\n`;
+  const message = `id: ${payload.id}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const client of set) client.write(message);
 }
 

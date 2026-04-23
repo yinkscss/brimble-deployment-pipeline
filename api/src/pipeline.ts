@@ -10,103 +10,177 @@ import type { LogStream } from "./types.js";
 const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 const CADDY_ADMIN_URL = process.env.CADDY_ADMIN_URL ?? "http://caddy:2019";
 const APPS_BASE_PATH = process.env.APPS_BASE_PATH ?? "/apps";
-const DOCKER_NETWORK = process.env.DOCKER_NETWORK ?? "job-application_platform";
+const DOCKER_NETWORK = process.env.DOCKER_NETWORK ?? "brimble-platform";
 const READINESS_TIMEOUT_MS = 120000;
+const CLONE_TIMEOUT_MS = Number(process.env.CLONE_TIMEOUT_MS ?? "180000");
+const UNZIP_TIMEOUT_MS = Number(process.env.UNZIP_TIMEOUT_MS ?? "120000");
+const BUILD_TIMEOUT_MS = Number(process.env.BUILD_TIMEOUT_MS ?? "1200000");
+const COMMAND_KILL_GRACE_MS = 5000;
+const READINESS_PROBE_TIMEOUT_MS = Number(process.env.READINESS_PROBE_TIMEOUT_MS ?? "3000");
+let caddyMutationLock: Promise<void> = Promise.resolve();
+
+async function withCaddyMutationLock<T>(fn: () => Promise<T>): Promise<T> {
+  const pending = caddyMutationLock;
+  let release: () => void = () => {};
+  caddyMutationLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await pending;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 async function addLog(deploymentId: string, line: string, stream: LogStream): Promise<void> {
   const log = await appendLog(ulid(), deploymentId, line, stream);
   publish(deploymentId, {
+    id: log.id,
     line: log.line,
     stream: log.stream,
     timestamp: log.timestamp
   });
 }
 
-function collectLines(
+async function collectLines(
   deploymentId: string,
   stream: LogStream,
   chunk: Buffer,
   remainderRef: { value: string }
-): void {
+): Promise<void> {
   const content = remainderRef.value + chunk.toString("utf8");
   const lines = content.split("\n");
   remainderRef.value = lines.pop() ?? "";
-  void Promise.all(lines.filter(Boolean).map((line) => addLog(deploymentId, line, stream)));
+  for (const line of lines.filter(Boolean)) {
+    await addLog(deploymentId, line, stream);
+  }
 }
+
+type RunCommandOptions = {
+  cwd?: string;
+  timeoutMs?: number;
+};
 
 async function runCommand(
   deploymentId: string,
   command: string,
   args: string[],
-  cwd?: string
+  options: RunCommandOptions = {}
 ): Promise<void> {
+  const { cwd, timeoutMs } = options;
   await addLog(deploymentId, `$ ${command} ${args.join(" ")}`, "stdout");
   await new Promise<void>((resolve, reject) => {
     const proc = spawn(command, args, { cwd });
     const stdoutRemainder = { value: "" };
     const stderrRemainder = { value: "" };
+    const pendingWrites = new Set<Promise<void>>();
+    let settled = false;
+    let timedOut = false;
 
-    proc.stdout.on("data", (chunk) => collectLines(deploymentId, "stdout", chunk, stdoutRemainder));
-    proc.stderr.on("data", (chunk) => collectLines(deploymentId, "stderr", chunk, stderrRemainder));
-    proc.on("error", reject);
+    const track = (promise: Promise<void>): void => {
+      pendingWrites.add(promise);
+      void promise.finally(() => {
+        pendingWrites.delete(promise);
+      });
+    };
+
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+
+    const timeoutHandle =
+      timeoutMs && timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            void addLog(
+              deploymentId,
+              `Command timed out after ${Math.round(timeoutMs / 1000)}s: ${command}`,
+              "stderr"
+            );
+            proc.kill("SIGTERM");
+            setTimeout(() => {
+              if (!proc.killed) proc.kill("SIGKILL");
+            }, COMMAND_KILL_GRACE_MS);
+          }, timeoutMs)
+        : null;
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      track(collectLines(deploymentId, "stdout", chunk, stdoutRemainder));
+    });
+    proc.stderr.on("data", (chunk: Buffer) => {
+      track(collectLines(deploymentId, "stderr", chunk, stderrRemainder));
+    });
+    proc.on("error", (error) => settle(() => reject(error)));
     proc.on("close", (code) => {
-      if (stdoutRemainder.value.trim()) void addLog(deploymentId, stdoutRemainder.value, "stdout");
-      if (stderrRemainder.value.trim()) void addLog(deploymentId, stderrRemainder.value, "stderr");
-      if (code === 0) resolve();
-      else reject(new Error(`Command failed (${command}) with code ${code}`));
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (stdoutRemainder.value.trim()) track(addLog(deploymentId, stdoutRemainder.value, "stdout"));
+      if (stderrRemainder.value.trim()) track(addLog(deploymentId, stderrRemainder.value, "stderr"));
+      void Promise.all(Array.from(pendingWrites)).then(() => {
+        settle(() => {
+          if (timedOut) reject(new Error(`Command timed out (${command})`));
+          else if (code === 0) resolve();
+          else reject(new Error(`Command failed (${command}) with code ${code}`));
+        });
+      });
     });
   });
 }
 
 async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstreamPort: number): Promise<string> {
-  const route = `${APPS_BASE_PATH}/${deploymentId}`;
-  const routeId = `app-${deploymentId}`;
-  const payload = {
-    "@id": routeId,
-    match: [{ path: [route, `${route}/*`] }],
-    handle: [
-      {
-        handler: "subroute",
-        routes: [
-          {
-            handle: [
-              {
-                handler: "rewrite",
-                strip_path_prefix: route
-              }
-            ]
-          },
-          {
-            handle: [
-              {
-                handler: "reverse_proxy",
-                upstreams: [{ dial: `${upstreamHost}:${upstreamPort}` }]
-              }
-            ]
-          }
-        ]
-      }
-    ]
-  };
+  return withCaddyMutationLock(async () => {
+    const route = `${APPS_BASE_PATH}/${deploymentId}`;
+    const routeId = `app-${deploymentId}`;
+    const payload = {
+      "@id": routeId,
+      match: [{ path: [route, `${route}/*`] }],
+      handle: [
+        {
+          handler: "subroute",
+          routes: [
+            {
+              handle: [
+                {
+                  handler: "rewrite",
+                  strip_path_prefix: route
+                }
+              ]
+            },
+            {
+              handle: [
+                {
+                  handler: "reverse_proxy",
+                  upstreams: [{ dial: `${upstreamHost}:${upstreamPort}` }]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    };
 
-  const routes = await readCaddyRoutes();
-  const insertionIndex = getAppRouteInsertionIndex(routes);
-  const nextRoutes = [...routes.slice(0, insertionIndex), payload, ...routes.slice(insertionIndex)];
+    const routes = await readCaddyRoutes();
+    const insertionIndex = getAppRouteInsertionIndex(routes);
+    const nextRoutes = [...routes.filter((entry) => entry["@id"] !== routeId)];
+    nextRoutes.splice(insertionIndex, 0, payload);
 
-  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(nextRoutes)
+    const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(nextRoutes)
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Failed to configure Caddy route: ${res.status} ${body}`);
+    }
+    return route;
   });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Failed to configure Caddy route: ${res.status} ${body}`);
-  }
-  return route;
 }
 
-type CaddyRoute = { match?: Array<{ path?: string[] }> };
+type CaddyRoute = { "@id"?: string; match?: Array<{ path?: string[] }> };
 
 async function readCaddyRoutes(): Promise<CaddyRoute[]> {
   const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`);
@@ -126,19 +200,26 @@ function getAppRouteInsertionIndex(routes: CaddyRoute[]): number {
 export async function removeCaddyRouteByPath(caddyRoute: string): Promise<void> {
   const deploymentId = caddyRoute.split("/").filter(Boolean).at(-1);
   if (!deploymentId) return;
-  await fetch(`${CADDY_ADMIN_URL}/id/app-${deploymentId}`, { method: "DELETE" });
+  await withCaddyMutationLock(async () => {
+    const res = await fetch(`${CADDY_ADMIN_URL}/id/app-${deploymentId}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 404) {
+      const body = await res.text();
+      throw new Error(`Failed to remove Caddy route: ${res.status} ${body}`);
+    }
+  });
 }
 
 export async function processDeployment(deploymentId: string, gitUrl: string): Promise<void> {
   const workdir = join("/app/tmp", deploymentId);
   await mkdir(workdir, { recursive: true });
   try {
-    await runCommand(deploymentId, "git", ["clone", "--depth", "1", gitUrl, workdir]);
+    await runCommand(deploymentId, "git", ["clone", "--depth", "1", gitUrl, workdir], { timeoutMs: CLONE_TIMEOUT_MS });
     await runPipelineFromDirectory(deploymentId, workdir);
   } catch (error) {
     await setDeploymentStatus(deploymentId, "failed");
     await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
-    publishEvent(deploymentId, "error", {
+    publishEvent(deploymentId, "pipeline_failed", {
+      status: "failed",
       message: error instanceof Error ? error.message : "Unknown pipeline error"
     });
   } finally {
@@ -150,7 +231,7 @@ export async function processUploadedDeployment(deploymentId: string, archivePat
   const workdir = join("/app/tmp", deploymentId);
   await mkdir(workdir, { recursive: true });
   try {
-    await runCommand(deploymentId, "unzip", ["-q", archivePath, "-d", workdir]);
+    await runCommand(deploymentId, "unzip", ["-q", archivePath, "-d", workdir], { timeoutMs: UNZIP_TIMEOUT_MS });
     const projectDir = await resolveProjectDirectory(workdir);
     if (projectDir !== workdir) {
       await addLog(deploymentId, `Detected nested project root: ${projectDir}`, "stdout");
@@ -159,7 +240,8 @@ export async function processUploadedDeployment(deploymentId: string, archivePat
   } catch (error) {
     await setDeploymentStatus(deploymentId, "failed");
     await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
-    publishEvent(deploymentId, "error", {
+    publishEvent(deploymentId, "pipeline_failed", {
+      status: "failed",
       message: error instanceof Error ? error.message : "Unknown pipeline error"
     });
   } finally {
@@ -187,7 +269,9 @@ async function waitForAppReadiness(
   const started = Date.now();
   while (Date.now() - started < READINESS_TIMEOUT_MS) {
     try {
-      const res = await fetch(`http://${upstreamHost}:${upstreamPort}/`);
+      const res = await fetch(`http://${upstreamHost}:${upstreamPort}/`, {
+        signal: AbortSignal.timeout(READINESS_PROBE_TIMEOUT_MS)
+      });
       if (res.ok || res.status < 500) {
         await addLog(deploymentId, `Readiness check passed: http://${upstreamHost}:${upstreamPort}/`, "stdout");
         return;
@@ -207,7 +291,9 @@ async function runPipelineFromDirectory(deploymentId: string, workdir: string): 
   let caddyRoute: string | null = null;
   try {
     await setDeploymentStatus(deploymentId, "building");
-    await runCommand(deploymentId, "railpack", ["build", "--name", imageTag, "--progress", "plain", workdir]);
+    await runCommand(deploymentId, "railpack", ["build", "--name", imageTag, "--progress", "plain", workdir], {
+      timeoutMs: BUILD_TIMEOUT_MS
+    });
     await updateDeployment(deploymentId, { image_tag: imageTag, status: "deploying" });
 
     const container = await docker.createContainer({
@@ -227,7 +313,7 @@ async function runPipelineFromDirectory(deploymentId: string, workdir: string): 
 
     caddyRoute = await putCaddyRoute(deploymentId, upstreamHost, port);
     await updateDeployment(deploymentId, { status: "running", container_id: containerId, caddy_route: caddyRoute });
-    publishEvent(deploymentId, "done", { status: "running", caddy_route: caddyRoute });
+    publishEvent(deploymentId, "pipeline_done", { status: "running", caddy_route: caddyRoute });
   } catch (error) {
     await setDeploymentStatus(deploymentId, "failed");
     await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
@@ -247,7 +333,8 @@ async function runPipelineFromDirectory(deploymentId: string, workdir: string): 
         // best-effort cleanup
       }
     }
-    publishEvent(deploymentId, "error", {
+    publishEvent(deploymentId, "pipeline_failed", {
+      status: "failed",
       message: error instanceof Error ? error.message : "Unknown pipeline error"
     });
   }

@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   createDeployment,
   getDeployment,
+  getLogsAfter,
   getLogs,
   initDb,
   listDeployments,
@@ -57,16 +58,21 @@ app.get("/deployments/:id", async (req, res) => {
 app.get("/deployments/:id/logs", async (req, res) => {
   const deployment = await getDeployment(req.params.id);
   if (!deployment) return res.status(404).json({ error: "Deployment not found" });
+  const cursorFromQuery = typeof req.query.cursor === "string" ? req.query.cursor : null;
+  const cursorFromHeader = req.get("last-event-id");
+  const cursor = cursorFromQuery ?? cursorFromHeader ?? null;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
-  const existing = await getLogs(req.params.id);
+  const existing = cursor ? await getLogsAfter(req.params.id, cursor) : await getLogs(req.params.id);
   for (const log of existing) {
     res.write(
+      `id: ${log.id}\n` +
       `data: ${JSON.stringify({
+        id: log.id,
         line: log.line,
         stream: log.stream,
         timestamp: log.timestamp
@@ -80,9 +86,13 @@ app.get("/deployments/:id/logs", async (req, res) => {
 
   subscribe(req.params.id, res);
   if (deployment.status === "running") {
-    res.write(`event: done\ndata: ${JSON.stringify({ status: "running", caddy_route: deployment.caddy_route })}\n\n`);
+    res.write(
+      `event: pipeline_done\ndata: ${JSON.stringify({ status: "running", caddy_route: deployment.caddy_route })}\n\n`
+    );
+  } else if (deployment.status === "deleted") {
+    res.write(`event: pipeline_done\ndata: ${JSON.stringify({ status: "deleted" })}\n\n`);
   } else if (deployment.status === "failed") {
-    res.write(`event: error\ndata: ${JSON.stringify({ status: "failed" })}\n\n`);
+    res.write(`event: pipeline_failed\ndata: ${JSON.stringify({ status: "failed" })}\n\n`);
   }
   req.on("close", () => {
     clearInterval(heartbeat);
@@ -101,8 +111,8 @@ app.delete("/deployments/:id", async (req, res) => {
       container_id: null,
       caddy_route: null
     });
-    await setDeploymentStatus(req.params.id, "failed");
-    publishEvent(req.params.id, "done", { status: "deleted" });
+    await setDeploymentStatus(req.params.id, "deleted");
+    publishEvent(req.params.id, "pipeline_done", { status: "deleted" });
     res.status(204).send();
   } catch (error) {
     res.status(500).json({

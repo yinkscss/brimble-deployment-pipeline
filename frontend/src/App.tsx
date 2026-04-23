@@ -16,6 +16,8 @@ function badge(status: Deployment["status"]): string {
       return "badge badge-running";
     case "failed":
       return "badge badge-failed";
+    case "deleted":
+      return "badge badge-pending";
     case "building":
       return "badge badge-building";
     case "deploying":
@@ -25,11 +27,15 @@ function badge(status: Deployment["status"]): string {
   }
 }
 
-const isTerminal = (status: Deployment["status"]) => status === "running" || status === "failed";
+const isTerminal = (status: Deployment["status"]) => status === "running" || status === "failed" || status === "deleted";
 
 export function App() {
   const qc = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const logCursorByDeploymentRef = useRef<Record<string, string>>({});
+  const seenLogIdsRef = useRef<Set<string>>(new Set());
+  const pauseBufferRef = useRef<LogEvent[]>([]);
+  const logsPausedRef = useRef(false);
   const [gitUrl, setGitUrl] = useState("");
   const [projectFile, setProjectFile] = useState<File | null>(null);
   const [sourceMode, setSourceMode] = useState<"git" | "zip">("git");
@@ -39,6 +45,24 @@ export function App() {
   const [logFilter, setLogFilter] = useState<"all" | "stdout" | "stderr">("all");
   const [logQuery, setLogQuery] = useState("");
   const [logsPaused, setLogsPaused] = useState(false);
+
+  useEffect(() => {
+    logsPausedRef.current = logsPaused;
+  }, [logsPaused]);
+
+  useEffect(() => {
+    setLogs([]);
+    setStreamState("idle");
+    seenLogIdsRef.current = new Set();
+    pauseBufferRef.current = [];
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (logsPaused) return;
+    if (!pauseBufferRef.current.length) return;
+    setLogs((prev) => [...prev, ...pauseBufferRef.current]);
+    pauseBufferRef.current = [];
+  }, [logsPaused]);
 
   const deploymentsQuery = useQuery({
     queryKey: ["deployments"],
@@ -111,30 +135,47 @@ export function App() {
     if (!selectedId) return;
 
     setStreamState("open");
-    const es = new EventSource(logsSseUrl(selectedId));
+    const es = new EventSource(logsSseUrl(selectedId, logCursorByDeploymentRef.current[selectedId] ?? null));
+
+    const appendLog = (data: LogEvent): void => {
+      if (seenLogIdsRef.current.has(data.id)) return;
+      seenLogIdsRef.current.add(data.id);
+      if (logsPausedRef.current) {
+        pauseBufferRef.current.push(data);
+        return;
+      }
+      setLogs((prev) => [...prev, data]);
+    };
+
     es.onmessage = (event) => {
-      if (logsPaused) return;
       try {
         const data = JSON.parse(event.data) as LogEvent;
-        setLogs((prev) => [...prev, data]);
+        const cursor = data.id || event.lastEventId;
+        if (cursor) {
+          logCursorByDeploymentRef.current[selectedId] = cursor;
+        }
+        appendLog(data);
       } catch {
         // ignore malformed line
       }
     };
-    es.addEventListener("done", () => {
+    es.addEventListener("pipeline_done", () => {
       setStreamState("done");
       es.close();
       void qc.invalidateQueries({ queryKey: ["deployments"] });
     });
-    es.addEventListener("error", () => {
+    es.addEventListener("pipeline_failed", () => {
       setStreamState("error");
       es.close();
       void qc.invalidateQueries({ queryKey: ["deployments"] });
     });
+    es.onerror = () => {
+      setStreamState((current) => (current === "done" || current === "error" ? current : "idle"));
+    };
     return () => {
       es.close();
     };
-  }, [logsPaused, qc, selectedId]);
+  }, [qc, selectedId]);
 
   return (
     <main className="container">
@@ -379,8 +420,8 @@ export function App() {
               <span>Select a deployment and stream to inspect build and runtime output.</span>
             </div>
           ) : (
-            filteredLogs.map((log, i) => (
-              <pre key={`${log.timestamp}-${i}`} className={`log-line ${log.stream === "stderr" ? "stderr" : "stdout"}`}>
+            filteredLogs.map((log) => (
+              <pre key={log.id} className={`log-line ${log.stream === "stderr" ? "stderr" : "stdout"}`}>
                 <span className="mono">[{new Date(log.timestamp).toLocaleTimeString()}]</span> {log.stream} | {log.line}
               </pre>
             ))

@@ -100,9 +100,22 @@ export async function getLogs(deploymentId: string): Promise<LogLine[]> {
       SELECT id, deployment_id, line, stream, timestamp::text
       FROM logs
       WHERE deployment_id = $1
-      ORDER BY timestamp ASC
+      ORDER BY id ASC
     `,
     [deploymentId]
+  );
+  return result.rows as LogLine[];
+}
+
+export async function getLogsAfter(deploymentId: string, afterId: string): Promise<LogLine[]> {
+  const result = await pool.query(
+    `
+      SELECT id, deployment_id, line, stream, timestamp::text
+      FROM logs
+      WHERE deployment_id = $1 AND id > $2
+      ORDER BY id ASC
+    `,
+    [deploymentId, afterId]
   );
   return result.rows as LogLine[];
 }

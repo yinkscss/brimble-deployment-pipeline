@@ -8,6 +8,9 @@
   "scripts": {
     "dev": "echo \"Use docker compose up\"",
     "build": "npm run build -w api && npm run build -w frontend",
-    "check:routing": "python3 scripts/check-routing.py"
+    "check:routing": "python3 scripts/check-routing.py",
+    "check:sse": "python3 scripts/check-sse.py",
+    "check:architecture": "python3 scripts/check-architecture-drift.py",
+    "check:contracts": "npm run check:architecture && npm run check:routing && npm run check:sse"
   }
 }
