@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "dev": "echo \"Use docker compose up\"",
-    "build": "npm run build -w api && npm run build -w frontend"
+    "build": "npm run build -w api && npm run build -w frontend",
+    "check:routing": "python3 scripts/check-routing.py"
   }
 }

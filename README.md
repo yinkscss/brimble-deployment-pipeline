@@ -52,6 +52,22 @@ docker compose up --build
 
 Then open [http://localhost](http://localhost).
 
+### Regression check: Caddy route order + app routing
+
+Run this after the stack is up:
+
+```bash
+npm run check:routing
+```
+
+What it verifies:
+
+- Creates a deployment from `sample-app` via upload API.
+- Waits until deployment reaches `running`.
+- Reads Caddy routes through the Admin API and asserts deployment route is before the frontend catch-all route.
+- Requests `/apps/:id/` and asserts the deployed app response is served (not frontend HTML).
+- Cleans up the created deployment.
+
 ## API surface
 
 - `POST /api/deployments` with either:
