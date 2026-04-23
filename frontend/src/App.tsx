@@ -309,7 +309,7 @@ export function App() {
                     <td className="truncate" title={d.caddy_route ?? undefined}>
                       {d.caddy_route ? (
                         <a href={d.caddy_route} target="_blank" rel="noopener noreferrer">
-                          {d.caddy_route}
+                          {new URL(d.caddy_route, window.location.origin).toString()}
                         </a>
                       ) : (
                         "-"

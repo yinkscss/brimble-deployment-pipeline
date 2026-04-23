@@ -40,6 +40,9 @@ Prereqs:
 
 - Docker + Docker Compose plugin
 - Internet access to pull base images and Railpack image
+- Port `80` available on host (Caddy ingress)
+- Docker daemon access with permission to mount `/var/run/docker.sock`
+- Container runtime that allows `privileged` mode for BuildKit
 
 Start:
 

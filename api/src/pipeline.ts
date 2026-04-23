@@ -60,8 +60,10 @@ async function runCommand(
 
 async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstreamPort: number): Promise<string> {
   const route = `${APPS_BASE_PATH}/${deploymentId}`;
+  const routeId = `app-${deploymentId}`;
   const payload = {
-    match: [{ path: [`${route}/*`] }],
+    "@id": routeId,
+    match: [{ path: [route, `${route}/*`] }],
     handle: [
       {
         handler: "subroute",
@@ -87,7 +89,7 @@ async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstrea
     ]
   };
 
-  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`, {
+  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes/0`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -101,18 +103,9 @@ async function putCaddyRoute(deploymentId: string, upstreamHost: string, upstrea
 }
 
 export async function removeCaddyRouteByPath(caddyRoute: string): Promise<void> {
-  const res = await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes`);
-  if (!res.ok) return;
-  const routes = (await res.json()) as unknown[];
-  const idx = routes.findIndex((route) => {
-    if (!route || typeof route !== "object") return false;
-    const record = route as { match?: Array<{ path?: string[] }> };
-    return record.match?.some((m) => m.path?.some((p) => p.startsWith(`${caddyRoute}/`)));
-  });
-  if (idx < 0) return;
-  await fetch(`${CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes/${idx}`, {
-    method: "DELETE"
-  });
+  const deploymentId = caddyRoute.split("/").filter(Boolean).at(-1);
+  if (!deploymentId) return;
+  await fetch(`${CADDY_ADMIN_URL}/id/app-${deploymentId}`, { method: "DELETE" });
 }
 
 export async function processDeployment(deploymentId: string, gitUrl: string): Promise<void> {
@@ -121,6 +114,12 @@ export async function processDeployment(deploymentId: string, gitUrl: string): P
   try {
     await runCommand(deploymentId, "git", ["clone", "--depth", "1", gitUrl, workdir]);
     await runPipelineFromDirectory(deploymentId, workdir);
+  } catch (error) {
+    await setDeploymentStatus(deploymentId, "failed");
+    await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
+    publishEvent(deploymentId, "error", {
+      message: error instanceof Error ? error.message : "Unknown pipeline error"
+    });
   } finally {
     await rm(workdir, { recursive: true, force: true });
   }
@@ -136,7 +135,14 @@ export async function processUploadedDeployment(deploymentId: string, archivePat
       await addLog(deploymentId, `Detected nested project root: ${projectDir}`, "stdout");
     }
     await runPipelineFromDirectory(deploymentId, projectDir);
+  } catch (error) {
+    await setDeploymentStatus(deploymentId, "failed");
+    await addLog(deploymentId, error instanceof Error ? error.message : String(error), "stderr");
+    publishEvent(deploymentId, "error", {
+      message: error instanceof Error ? error.message : "Unknown pipeline error"
+    });
   } finally {
+    await rm(archivePath, { force: true });
     await rm(workdir, { recursive: true, force: true });
   }
 }
@@ -177,6 +183,7 @@ async function waitForAppReadiness(
 async function runPipelineFromDirectory(deploymentId: string, workdir: string): Promise<void> {
   const imageTag = `deployment-${deploymentId.toLowerCase()}:latest`;
   let containerId: string | null = null;
+  let caddyRoute: string | null = null;
   try {
     await setDeploymentStatus(deploymentId, "building");
     await runCommand(deploymentId, "railpack", ["build", "--name", imageTag, "--progress", "plain", workdir]);
@@ -197,7 +204,7 @@ async function runPipelineFromDirectory(deploymentId: string, workdir: string): 
     const upstreamHost = `app-${deploymentId}`;
     await waitForAppReadiness(deploymentId, upstreamHost, port);
 
-    const caddyRoute = await putCaddyRoute(deploymentId, upstreamHost, port);
+    caddyRoute = await putCaddyRoute(deploymentId, upstreamHost, port);
     await updateDeployment(deploymentId, { status: "running", container_id: containerId, caddy_route: caddyRoute });
     publishEvent(deploymentId, "done", { status: "running", caddy_route: caddyRoute });
   } catch (error) {
@@ -208,6 +215,13 @@ async function runPipelineFromDirectory(deploymentId: string, workdir: string): 
         const c = docker.getContainer(containerId);
         await c.stop({ t: 2 });
         await c.remove({ force: true });
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    if (caddyRoute) {
+      try {
+        await removeCaddyRouteByPath(caddyRoute);
       } catch {
         // best-effort cleanup
       }

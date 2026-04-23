@@ -22,7 +22,7 @@ services:
       PORT: 3001
       DATABASE_URL: postgres://brimble:brimble@db:5432/brimble
       CADDY_ADMIN_URL: http://caddy:2019
-      DOCKER_NETWORK: job-application_platform
+      DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:-job-application}_platform
       APPS_BASE_PATH: /apps
       BUILDKIT_HOST: tcp://buildkit:1234
     volumes:
@@ -32,7 +32,7 @@ services:
       db:
         condition: service_healthy
       buildkit:
-        condition: service_started
+        condition: service_healthy
     networks:
       - platform
 
@@ -50,6 +50,11 @@ services:
     image: moby/buildkit:latest
     command: ["--addr", "tcp://0.0.0.0:1234"]
     privileged: true
+    healthcheck:
+      test: ["CMD", "buildctl", "--addr", "tcp://127.0.0.1:1234", "debug", "workers"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     networks:
       - platform
 
